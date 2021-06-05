@@ -21,6 +21,7 @@ use cortex_m::peripheral::NVIC;
 use heapless::consts::*;
 use heapless::Vec;
 use heapless::String;
+use libm::*;
 use wio::{entry, Pins, Sets};
 use wio::hal::adc::{FreeRunning, InterruptAdc};
 use wio::hal::clock::GenericClockController;
@@ -44,6 +45,8 @@ static mut CTX: Option<Ctx> = None;
 
 const SMP_POINTS: usize = 2048;
 const ADC_SAMPLING_RATE: f32 = 83333.0;
+const ADC_SAMPLING_ADJ:  f32 = 356.0;
+const SMP_THRE: u16 = 1024;
 
 type SamplingBuffer = heapless::Vec<u16, U2048>; //サンプリングバッファの型
 
@@ -102,6 +105,14 @@ fn main() -> ! {
     )
     .draw(&mut display)
     .unwrap();
+    // mater marker
+    egrectangle!(
+        top_left = (SCREEN_WIDTH/2-5,0),
+        bottom_right = (SCREEN_WIDTH/2+5, 32),
+        style = primitive_style!(fill_color = Rgb565::BLUE)
+    )
+    .draw(&mut display)
+    .unwrap();
 
     // shared resources initialization
     unsafe {
@@ -133,15 +144,16 @@ fn main() -> ! {
         let len = processing_buffer.len();
         let cap = processing_buffer.capacity();
         if len == cap {
-            // average
-            let mut sum = 0 as u32;
-            for i in 0..SMP_POINTS {
-                sum += processing_buffer[i] as u32;
-            }
-            let avg = sum as f32/SMP_POINTS as f32;
+            let mut oarray: [u16; SMP_POINTS] = [0;SMP_POINTS];
             let mut barray: [u8; SMP_POINTS] = [0;SMP_POINTS];
+            let (avg, flg) = normalization(&processing_buffer, &mut oarray);
+            if flg == 1 {
+                processing_buffer.clear();
+                continue;
+            }
             // make barray
-            get_barray(&processing_buffer, avg, &mut barray);
+            //get_barray(&processing_buffer, avg, &mut barray);
+            get_barray(&oarray, avg, &mut barray);
             // Inflate 1
             inflate_barray(&mut barray, 1);
             inflate_barray(&mut barray, 1);
@@ -169,26 +181,25 @@ fn main() -> ! {
             }
             nb::block!(serial.write(0x0d as u8)).unwrap();
             */
-            //writeln!(&mut serial, "Average: {}",avg).unwrap();
-            //writeln!(&mut serial, "psum {}",psum).unwrap();
-            //writeln!(&mut serial, "pnum {}",pnum).unwrap();
-            //writeln!(&mut serial, "pdiff {}",pdiff).unwrap();
+            //if true {
             if pdiff <= 100 {
                 asum += psum;
                 anum += pnum;
                 cntr += 1;
-                if cntr == 40 {
-                    let avg = asum as f32 / anum as f32;
-                    let freq = (ADC_SAMPLING_RATE - 365.0) / avg;
-                    //let freq = (ADC_SAMPLING_RATE ) / avg;
-                    writeln!(&mut serial, "avg: {}",avg).unwrap();
+                if cntr == 20 {
+                    let avg2 = asum as f32 / anum as f32;
+                    let freq = (ADC_SAMPLING_RATE - ADC_SAMPLING_ADJ) / avg2;
+                    writeln!(&mut serial, "avg: {}",avg2).unwrap();
                     writeln!(&mut serial, "frequency: {}",freq).unwrap();
                     asum = 0;
                     anum = 0;
                     cntr = 0;
 
-                    draw(&mut display, freq);
-
+                    //let note = 14;
+                    let (note,diff) = get_note_from_freq(440.0, freq);
+                    draw_meter(&mut display, diff);
+                    draw_note(&mut display, note);
+                    draw_freq(&mut display, freq);
                     /*
                     // waiting 1 charactor for the next
                     loop {
@@ -216,10 +227,32 @@ fn main() -> ! {
 
 }
 
+fn normalization(iarray: &[u16], oarray: &mut [u16]) -> (f32, u32)  {
+    let mut min = 0x7fff as u16;
+    let mut max = 0 as u16;
+    for i in 0..SMP_POINTS-1 {
+        if iarray[i] > max {
+            max = iarray[i];
+        }
+        else if iarray[i] < min {
+            min = iarray[i];
+        }
+    }
+    let flg = if max - min > SMP_THRE { 1 } else { 0 };
+
+    let mut sum = 0.0 as u32;
+    for i in 0..SMP_POINTS-1 {
+        let tmp = ((iarray[i] - min) as f32 * (0x00003fff as f32/(max - min) as f32)) as u16;
+        oarray[i] = tmp;
+        sum += tmp as u32;
+    }
+    (sum as f32 / SMP_POINTS as f32, flg)
+}
+
 fn get_barray(iarray: &[u16], avg: f32, barray: &mut [u8]) {
     for i in 3..SMP_POINTS-3 {
-        let sum = iarray[i-3] + iarray[i-2] + iarray[i-1] + iarray[i]
-                              + iarray[i+1] + iarray[i+2] + iarray[i+3];
+        let sum = iarray[i-3] as u32 + iarray[i-2] as u32 + iarray[i-1] as u32 + iarray[i] as u32
+                              + iarray[i+1] as u32 + iarray[i+2] as u32 + iarray[i+3] as u32;
         let diff = sum as f32 / 7.0 - avg;
         if diff < 0.0 {
             barray[i] = 0;
@@ -280,17 +313,17 @@ fn get_rise_edge(barray: &[u8]) -> (u32, u32, u32) {
 
 const SCREEN_WIDTH: i32 = 320;
 const SCREEN_HEIGHT: i32 = 240;
+const FONT_WIDTH: i32 = 24;
+const FONT_HEIGHT: i32 = 32;
 
-fn draw<T>(display: &mut T, freq: f32)
+fn draw_freq<T>(display: &mut T, freq: f32)
 where
     T: embedded_graphics::DrawTarget<Rgb565>,
 {
     // clear area
-    const FONT_WIDTH: i32 = 24;
-    const FONT_HEIGHT: i32 = 32;
     egrectangle!(
-        top_left = (0,0),
-        bottom_right = (SCREEN_WIDTH-1, FONT_HEIGHT),
+        top_left = (0,192),
+        bottom_right = (SCREEN_WIDTH-1, 224),
         style = primitive_style!(fill_color = Rgb565::BLACK)
     )
     .draw(display);
@@ -304,10 +337,101 @@ where
     let left = SCREEN_WIDTH - (length as i32) * FONT_WIDTH;
     egtext!(
         text = textbuffer.as_str(),
-        top_left = (left, 0),
+        top_left = (left, 192),
         style = text_style!(font = Font24x32, text_color = Rgb565::WHITE)
     )
     .draw(display);
+}
+
+fn draw_note<T>(display: &mut T, note: u32)
+where
+    T: embedded_graphics::DrawTarget<Rgb565>,
+{
+    // clear area
+    egrectangle!(
+        top_left = (0,150),
+        bottom_right = (SCREEN_WIDTH-1, 182),
+        style = primitive_style!(fill_color = Rgb565::BLACK)
+    )
+    .draw(display);
+
+    // get note name form note num
+    let (name,num) = get_note_name(note);
+
+    let mut textbuffer = String::<U256>::new();
+    write!(&mut textbuffer, "{} / {}", name, num).unwrap();
+    //
+    let length = textbuffer.len();
+    //
+    let left = SCREEN_WIDTH - (length as i32) * FONT_WIDTH;
+    egtext!(
+        text = textbuffer.as_str(),
+        top_left = (left, 150),
+        style = text_style!(font = Font24x32, text_color = Rgb565::WHITE)
+    )
+    .draw(display);
+}
+
+fn draw_meter<T>(display: &mut T, diff: f32)
+where
+    T: embedded_graphics::DrawTarget<Rgb565>,
+{
+    // clear area
+    egrectangle!(
+        top_left = (0,32),
+        bottom_right = (SCREEN_WIDTH-1, 64),
+        style = primitive_style!(fill_color = Rgb565::BLACK)
+    )
+    .draw(display);
+
+    egrectangle!(
+        top_left = (diff as i32,32),
+        bottom_right = (diff as i32 + 10, 64),
+        style = primitive_style!(fill_color = Rgb565::WHITE)
+    )
+    .draw(display);
+    /*
+    let mut textbuffer = String::<U256>::new();
+    write!(&mut textbuffer, "{}", diff).unwrap();
+    let length = textbuffer.len();
+    let left = SCREEN_WIDTH - (length as i32) * FONT_WIDTH;
+    egtext!(
+        text = textbuffer.as_str(),
+        top_left = (left, 32),
+        style = text_style!(font = Font24x32, text_color = Rgb565::WHITE)
+    )
+    .draw(display);
+    */
+}
+
+fn get_note_name(note: u32) -> (&'static str, u32) {
+    let num  = (note + 8) / 12;
+    let tone = (note + 8) % 12;
+    let mut name = "";
+    match tone {
+        0 => name = "C",
+        1 => name = "C#",
+        2 => name = "D",
+        3 => name = "D#",
+        4 => name = "E",
+        5 => name = "F",
+        6 => name = "F#",
+        7 => name = "G",
+        8 => name = "G#",
+        9 => name = "A",
+        10 => name = "A#",
+        11 => name = "B",
+        n => name = "XX",
+    }
+    return (&name,num)
+}
+
+fn get_note_from_freq(fpitch: f32, freq: f32) -> (u32, f32) {
+    let tone_num = 49.0 + 12.0 * log2f(freq / fpitch);
+    let tone = (tone_num + 0.5) as u32;
+    let diff = (tone_num - (tone as f32)) * (SCREEN_WIDTH as f32 - 20.0)
+                + SCREEN_WIDTH as f32 / 2.0;
+    return (tone,diff);
 }
 
 #[interrupt]
@@ -324,6 +448,8 @@ fn ADC1_RESRDY() {
                         &mut ctx.processing_buffer,
                         &mut ctx.sampling_buffer,
                     );
+                } else {
+                    sampling_buffer.clear();
                 }
             } else {
                 let _ = sampling_buffer.push(sample);
