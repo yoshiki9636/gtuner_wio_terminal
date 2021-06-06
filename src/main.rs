@@ -48,7 +48,7 @@ static mut CTX: Option<Ctx> = None;
 const SMP_POINTS: usize = 2048;
 const ADC_SAMPLING_RATE: f32 = 83333.0;
 const ADC_SAMPLING_ADJ:  f32 = 356.0;
-const SMP_THRE: u16 = 1024;
+const SMP_THRE: u16 = 2048;
 
 const SCREEN_WIDTH: i32 = 320;
 const SCREEN_HEIGHT: i32 = 240;
