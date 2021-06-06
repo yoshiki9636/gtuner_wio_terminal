@@ -128,6 +128,9 @@ fn main() -> ! {
     )
     .draw(&mut display)
     .unwrap();
+    // draw inital values
+    draw_freq(&mut display, 0.0, 0);
+    draw_freq(&mut display, 440.0, 1);
 
     // shared resources initialization
     unsafe {
@@ -149,6 +152,7 @@ fn main() -> ! {
 
     // Pitch frequency initialization
     let mut fpitch = 440.0 as f32;
+    // buttons press status
     let mut press_up   = 0 as u8;
     let mut press_down = 0 as u8;
     // Loop variable initialization
