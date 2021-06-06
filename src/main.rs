@@ -34,6 +34,7 @@ use eg::{
 };
 use embedded_graphics as eg;
 
+// Buffer structure
 struct Ctx {
     adc: InterruptAdc<ADC1, FreeRunning>,
     buffers: [SamplingBuffer; 2],
@@ -48,10 +49,17 @@ const ADC_SAMPLING_RATE: f32 = 83333.0;
 const ADC_SAMPLING_ADJ:  f32 = 356.0;
 const SMP_THRE: u16 = 1024;
 
-type SamplingBuffer = heapless::Vec<u16, U2048>; //サンプリングバッファの型
+const SCREEN_WIDTH: i32 = 320;
+const SCREEN_HEIGHT: i32 = 240;
+const FONT_WIDTH: i32 = 24;
+const FONT_HEIGHT: i32 = 32;
+
+type SamplingBuffer = heapless::Vec<u16, U2048>;
 
 #[entry]
 fn main() -> ! {
+
+    // Initializing peripherals
     let mut peripherals = Peripherals::take().unwrap();
     let core = CorePeripherals::take().unwrap();
     let mut clocks = GenericClockController::with_external_32kosc(
@@ -62,7 +70,7 @@ fn main() -> ! {
         &mut peripherals.NVMCTRL,
     );
 
-    // TODO: UARTドライバオブジェクトを初期化する
+    // UART initialization for debugging monitor
     let mut sets: Sets = Pins::new(peripherals.PORT).split();
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
@@ -74,6 +82,7 @@ fn main() -> ! {
         &mut sets.port,
     );
 
+    // Microphone ADC initialization
     let (microphone_adc, mut microphone_pin) = sets.microphone.init(
         peripherals.ADC1,
         &mut clocks,
@@ -84,7 +93,7 @@ fn main() -> ! {
     // start ADC
     microphone_adc.start_conversion(&mut microphone_pin);
 
-    // LCDの初期化
+    // LCD initialization
     let (mut display, _backlight) = sets
         .display
         .init(
@@ -97,7 +106,7 @@ fn main() -> ! {
         )
         .unwrap();
 
-    // LCDのクリア（全体を黒で塗りつぶす）
+    // Draw black to LCD
     egrectangle!(
         top_left = (0, 0),
         bottom_right = (SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1),
@@ -105,7 +114,7 @@ fn main() -> ! {
     )
     .draw(&mut display)
     .unwrap();
-    // mater marker
+    // Draw tuner mater center marker
     egrectangle!(
         top_left = (SCREEN_WIDTH/2-5,0),
         bottom_right = (SCREEN_WIDTH/2+5, 32),
@@ -128,46 +137,55 @@ fn main() -> ! {
         ctx.sampling_buffer = Some(first);
         ctx.processing_buffer = Some(&mut rest[0]);
     }
-    writeln!(&mut serial, "start").unwrap();
+    writeln!(&mut serial, "start").unwrap(); // for debugging
     unsafe { NVIC::unmask(interrupt::ADC1_RESRDY); }
-    writeln!(&mut serial, "check1").unwrap();
+    writeln!(&mut serial, "check1").unwrap(); // for debugging
 
-    let mut cntr = 0;
-    let mut asum = 0;
-    let mut anum = 0;
-
+    // Loop variable initialization
+    let mut cntr = 0; // loop counter
+    let mut asum = 0; // sum of all data for average to get frecuency
+    let mut anum = 0; // number of all data for average to get frecuency
+    // main loop
     loop {
+        // get processing buffer 
         let processing_buffer = unsafe {
             let ctx = CTX.as_mut().unwrap();
             ctx.processing_buffer.as_mut().unwrap()
         };
         let len = processing_buffer.len();
         let cap = processing_buffer.capacity();
+        // if processing buffer is full -> processing
+        //                     not full -> skip processing and continue to next loop
         if len == cap {
+            // temporary buffers for filterling
             let mut oarray: [u16; SMP_POINTS] = [0;SMP_POINTS];
             let mut barray: [u8; SMP_POINTS] = [0;SMP_POINTS];
+            // normalization filter :: output: oarray, avg, flg
             let (avg, flg) = normalization(&processing_buffer, &mut oarray);
+            // attack cancelletion filter : threshold : SMP_THRE
             if flg == 1 {
                 processing_buffer.clear();
                 continue;
             }
-            // make barray
-            //get_barray(&processing_buffer, avg, &mut barray);
+            // low pass filter & make barray data
+            // 1. 7 tap moving average for low pass filter
+            // 2. make barray data : binary data : AVG> -> 0  AVG<= -> 1
             get_barray(&oarray, avg, &mut barray);
-            // Inflate 1
+            // inflate filter
+            //   infrate 1 data of edge (0-1, 1-0 or 1-0, 0-1 : depend on num)
+            // Inflate 1 : 2 times
             inflate_barray(&mut barray, 1);
             inflate_barray(&mut barray, 1);
-            // Inflate 0
+            // Inflate 0 : 4 times
             inflate_barray(&mut barray, 0);
             inflate_barray(&mut barray, 0);
             inflate_barray(&mut barray, 0);
             inflate_barray(&mut barray, 0);
-            // Inflate 1
+            // Inflate 1 : 2 times
             inflate_barray(&mut barray, 1);
             inflate_barray(&mut barray, 1);
             // get rise edge period, count, max-min
             let (psum, pnum, pdiff) = get_rise_edge(&barray); 
-            //let avg = psum as f32 / pnum as f32;
 
             /*
             // for debugging
@@ -181,26 +199,36 @@ fn main() -> ! {
             }
             nb::block!(serial.write(0x0d as u8)).unwrap();
             */
-            //if true {
+            // pdiff : fructuation of piriods : if it is large, average has no meaning.
+            //         if it is large, do nothing and clear buffer
             if pdiff <= 100 {
+                // add to loop variable
                 asum += psum;
                 anum += pnum;
                 cntr += 1;
+                // 20 data is used for frecuency result
                 if cntr == 20 {
-                    let avg2 = asum as f32 / anum as f32;
-                    let freq = (ADC_SAMPLING_RATE - ADC_SAMPLING_ADJ) / avg2;
-                    writeln!(&mut serial, "avg: {}",avg2).unwrap();
-                    writeln!(&mut serial, "frequency: {}",freq).unwrap();
+                    // calcurate frecuency
+                    //   ADC_SAMPLING_ADJ is sampling rate adust parameter
+                    let favg = asum as f32 / anum as f32;
+                    let freq = (ADC_SAMPLING_RATE - ADC_SAMPLING_ADJ) / favg;
+                    writeln!(&mut serial, "avg: {}",favg).unwrap(); // for debugging
+                    writeln!(&mut serial, "frequency: {}",freq).unwrap(); // for debugging
+                    // clear loop parameter
                     asum = 0;
                     anum = 0;
                     cntr = 0;
 
-                    //let note = 14;
+                    // get note number and fine difference from frequency
                     let (note,diff) = get_note_from_freq(440.0, freq);
+                    // draw fine meter
                     draw_meter(&mut display, diff);
+                    // draw note name and number
                     draw_note(&mut display, note);
+                    // fraw frequeancy
                     draw_freq(&mut display, freq);
                     /*
+                    // for debugging
                     // waiting 1 charactor for the next
                     loop {
                         if let Ok(c) = nb::block!(serial.read()) {
@@ -213,8 +241,8 @@ fn main() -> ! {
             }
             processing_buffer.clear();
         }
-
         /*
+        // for debugging
         // waiting 1 charactor for the next
         loop {
             if let Ok(c) = nb::block!(serial.read()) {
@@ -224,10 +252,11 @@ fn main() -> ! {
         }
         */
     }
-
 }
 
+// normalization function
 fn normalization(iarray: &[u16], oarray: &mut [u16]) -> (f32, u32)  {
+    // get min,max
     let mut min = 0x7fff as u16;
     let mut max = 0 as u16;
     for i in 0..SMP_POINTS-1 {
@@ -238,22 +267,30 @@ fn normalization(iarray: &[u16], oarray: &mut [u16]) -> (f32, u32)  {
             min = iarray[i];
         }
     }
+    // get intensity flg 0: OK 1:NG
     let flg = if max - min > SMP_THRE { 1 } else { 0 };
 
+    // get normalized data -> oarray
     let mut sum = 0.0 as u32;
     for i in 0..SMP_POINTS-1 {
+        // scaling
         let tmp = ((iarray[i] - min) as f32 * (0x00003fff as f32/(max - min) as f32)) as u16;
         oarray[i] = tmp;
+        // sum for average
         sum += tmp as u32;
     }
     (sum as f32 / SMP_POINTS as f32, flg)
 }
 
+// moving average and making binary array
 fn get_barray(iarray: &[u16], avg: f32, barray: &mut [u8]) {
+    // first and last 3 result does not exist becase these positions cannot get 7 taps. 
     for i in 3..SMP_POINTS-3 {
+        // moving average
         let sum = iarray[i-3] as u32 + iarray[i-2] as u32 + iarray[i-1] as u32 + iarray[i] as u32
                               + iarray[i+1] as u32 + iarray[i+2] as u32 + iarray[i+3] as u32;
         let diff = sum as f32 / 7.0 - avg;
+        // making binary data
         if diff < 0.0 {
             barray[i] = 0;
         } else {
@@ -262,11 +299,17 @@ fn get_barray(iarray: &[u16], avg: f32, barray: &mut [u8]) {
     }
 }
 
+// infragte binary data
+//   num : choosing infrate data, 0 or 1
 fn inflate_barray(barray: &mut [u8], num: u8) {
+    // copy data to temporary buffer carray
     let mut carray: [u8; SMP_POINTS] = [0;SMP_POINTS];
     for i in 3..SMP_POINTS-3 {
         carray[i] = barray[i];
     }
+    // infrate function
+    //   carray : reference data 
+    //   barray : modifying data 
     for i in 3..SMP_POINTS-4 {
         if (carray[i] == num)&(carray[i+1] != num) {
             barray[i+1] = num;
@@ -277,9 +320,11 @@ fn inflate_barray(barray: &mut [u8], num: u8) {
     }
 }
 
+// getting rise edge (0->1) to get piriod of wave
 fn get_rise_edge(barray: &[u8]) -> (u32, u32, u32) {
-    // get rise edge placement
-    // dont use final data
+    // Getting rise edge positions and difference of positons that is wave periods.
+    // Last data of barray does not use because the data is meaningless.
+    // Term list has perods of waves.
     let mut term: heapless::Vec<u16,U50> = Vec::new();
     let mut current = 0;
     for i in 3..SMP_POINTS-5 {
@@ -292,7 +337,7 @@ fn get_rise_edge(barray: &[u8]) -> (u32, u32, u32) {
             }
         }
     }
-    // get rise edge period, count, max-min
+    // getting sum of wave periods, count, max-min(diff)
     let mut sum = 0;
     let mut num = 0;
     let mut min = 10000;
@@ -311,11 +356,46 @@ fn get_rise_edge(barray: &[u8]) -> (u32, u32, u32) {
     (sum, num, diff as u32)
 }
 
-const SCREEN_WIDTH: i32 = 320;
-const SCREEN_HEIGHT: i32 = 240;
-const FONT_WIDTH: i32 = 24;
-const FONT_HEIGHT: i32 = 32;
+// getting note name
+//  Input note is a number of note which starts A/0 as 1
+fn get_note_name(note: u32) -> (&'static str, u32) {
+    let num  = (note + 8) / 12;
+    let tone = (note + 8) % 12;
+    let mut name = "";
+    match tone {
+        0 => name = "C",
+        1 => name = "C#",
+        2 => name = "D",
+        3 => name = "D#",
+        4 => name = "E",
+        5 => name = "F",
+        6 => name = "F#",
+        7 => name = "G",
+        8 => name = "G#",
+        9 => name = "A",
+        10 => name = "A#",
+        11 => name = "B",
+        n => name = "XX",
+    }
+    return (&name,num)
+}
 
+// Transrate note number from frequency using equal temperament
+//  Equal temperament : f(k) = f(1)*2^(k/12)
+//                          k = i - 49  (means f(1)=A/4=440Hz)
+//  This function is inverse funciton of it.
+//    i = 49 + 12 * log2(f(k)/f(1))
+//   tone is an integer part of i
+//   diff is a fraction part of i and scaled to display size
+fn get_note_from_freq(fpitch: f32, freq: f32) -> (u32, f32) {
+    let tone_num = 49.0 + 12.0 * log2f(freq / fpitch);
+    let tone = (tone_num + 0.5) as u32;
+    let diff = (tone_num - (tone as f32)) * (SCREEN_WIDTH as f32 - 20.0)
+                + SCREEN_WIDTH as f32 / 2.0;
+    return (tone,diff);
+}
+
+// draw freqrency part
 fn draw_freq<T>(display: &mut T, freq: f32)
 where
     T: embedded_graphics::DrawTarget<Rgb565>,
@@ -343,6 +423,7 @@ where
     .draw(display);
 }
 
+// draw note part
 fn draw_note<T>(display: &mut T, note: u32)
 where
     T: embedded_graphics::DrawTarget<Rgb565>,
@@ -372,6 +453,7 @@ where
     .draw(display);
 }
 
+// draw meter part
 fn draw_meter<T>(display: &mut T, diff: f32)
 where
     T: embedded_graphics::DrawTarget<Rgb565>,
@@ -391,6 +473,7 @@ where
     )
     .draw(display);
     /*
+    // for debuffing
     let mut textbuffer = String::<U256>::new();
     write!(&mut textbuffer, "{}", diff).unwrap();
     let length = textbuffer.len();
@@ -404,36 +487,9 @@ where
     */
 }
 
-fn get_note_name(note: u32) -> (&'static str, u32) {
-    let num  = (note + 8) / 12;
-    let tone = (note + 8) % 12;
-    let mut name = "";
-    match tone {
-        0 => name = "C",
-        1 => name = "C#",
-        2 => name = "D",
-        3 => name = "D#",
-        4 => name = "E",
-        5 => name = "F",
-        6 => name = "F#",
-        7 => name = "G",
-        8 => name = "G#",
-        9 => name = "A",
-        10 => name = "A#",
-        11 => name = "B",
-        n => name = "XX",
-    }
-    return (&name,num)
-}
-
-fn get_note_from_freq(fpitch: f32, freq: f32) -> (u32, f32) {
-    let tone_num = 49.0 + 12.0 * log2f(freq / fpitch);
-    let tone = (tone_num + 0.5) as u32;
-    let diff = (tone_num - (tone as f32)) * (SCREEN_WIDTH as f32 - 20.0)
-                + SCREEN_WIDTH as f32 / 2.0;
-    return (tone,diff);
-}
-
+// interrupt part
+//   Currently if sampling buffer is full when processing buffer still used,
+//   the data is thrown away and clear sampling buffer, because of processing latest data.
 #[interrupt]
 fn ADC1_RESRDY() {
     unsafe {
@@ -449,7 +505,7 @@ fn ADC1_RESRDY() {
                         &mut ctx.sampling_buffer,
                     );
                 } else {
-                    sampling_buffer.clear();
+                    sampling_buffer.clear(); // throw away data and restart sampling
                 }
             } else {
                 let _ = sampling_buffer.push(sample);
