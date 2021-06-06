@@ -26,6 +26,7 @@ use wio::{entry, Pins, Sets};
 use wio::hal::adc::{FreeRunning, InterruptAdc};
 use wio::hal::clock::GenericClockController;
 use wio::hal::delay::Delay;
+use wio::hal::gpio::*;
 use wio::pac::{interrupt, CorePeripherals, Peripherals, ADC1};
 use wio::prelude::*;
 use eg::{
@@ -69,9 +70,14 @@ fn main() -> ! {
         &mut peripherals.OSCCTRL,
         &mut peripherals.NVMCTRL,
     );
+    
+    // GPIO initialization
+    // using button3 for up frequency, button2 for down frequency
+    let mut sets: Sets = Pins::new(peripherals.PORT).split();
+    let button_up   = sets.buttons.button3.into_floating_input(&mut sets.port);
+    let button_down = sets.buttons.button2.into_floating_input(&mut sets.port);
 
     // UART initialization for debugging monitor
-    let mut sets: Sets = Pins::new(peripherals.PORT).split();
     let mut delay = Delay::new(core.SYST, &mut clocks);
 
     let mut serial = sets.uart.init(
@@ -141,6 +147,10 @@ fn main() -> ! {
     unsafe { NVIC::unmask(interrupt::ADC1_RESRDY); }
     writeln!(&mut serial, "check1").unwrap(); // for debugging
 
+    // Pitch frequency initialization
+    let mut fpitch = 440.0 as f32;
+    let mut press_up   = 0 as u8;
+    let mut press_down = 0 as u8;
     // Loop variable initialization
     let mut cntr = 0; // loop counter
     let mut asum = 0; // sum of all data for average to get frecuency
@@ -206,7 +216,7 @@ fn main() -> ! {
                 asum += psum;
                 anum += pnum;
                 cntr += 1;
-                // 20 data is used for frecuency result
+                // 20 data are used for frecuency result
                 if cntr == 20 {
                     // calcurate frecuency
                     //   ADC_SAMPLING_ADJ is sampling rate adust parameter
@@ -220,13 +230,15 @@ fn main() -> ! {
                     cntr = 0;
 
                     // get note number and fine difference from frequency
-                    let (note,diff) = get_note_from_freq(440.0, freq);
+                    let (note,diff) = get_note_from_freq(fpitch, freq);
                     // draw fine meter
                     draw_meter(&mut display, diff);
                     // draw note name and number
                     draw_note(&mut display, note);
-                    // fraw frequeancy
-                    draw_freq(&mut display, freq);
+                    // draw wave frequeancy
+                    draw_freq(&mut display, freq, 0);
+                    // draw pitch frequency
+                    draw_freq(&mut display, fpitch, 1);
                     /*
                     // for debugging
                     // waiting 1 charactor for the next
@@ -251,6 +263,19 @@ fn main() -> ! {
             }
         }
         */
+        // scanning buttons
+        if (button_up.is_low().unwrap())&(press_up == 0) {
+            fpitch += 1.0 as f32;
+            press_up = 1
+        } else if button_up.is_high().unwrap() {
+            press_up = 0
+        }
+        if (button_down.is_low().unwrap())&(press_down == 0) {
+            fpitch -= 1.0 as f32;
+            press_down = 1
+        } else if button_down.is_high().unwrap() {
+            press_down = 0
+        }
     }
 }
 
@@ -396,28 +421,33 @@ fn get_note_from_freq(fpitch: f32, freq: f32) -> (u32, f32) {
 }
 
 // draw freqrency part
-fn draw_freq<T>(display: &mut T, freq: f32)
+fn draw_freq<T>(display: &mut T, freq: f32, flag: u8)
 where
     T: embedded_graphics::DrawTarget<Rgb565>,
 {
+    let y = if flag == 0 {150} else {192};
     // clear area
     egrectangle!(
-        top_left = (0,192),
-        bottom_right = (SCREEN_WIDTH-1, 224),
+        top_left = (0,y),
+        bottom_right = (SCREEN_WIDTH-1, y+FONT_HEIGHT),
         style = primitive_style!(fill_color = Rgb565::BLACK)
     )
     .draw(display);
 
     // draw frequency
     let mut textbuffer = String::<U256>::new();
-    write!(&mut textbuffer, "{:.2} Hz", freq).unwrap();
+    if flag == 0 {
+        write!(&mut textbuffer, "{:.2} Hz", freq).unwrap();
+    } else {
+        write!(&mut textbuffer, "P {:.0} Hz", freq).unwrap();
+    }
     //
     let length = textbuffer.len();
     //
     let left = SCREEN_WIDTH - (length as i32) * FONT_WIDTH;
     egtext!(
         text = textbuffer.as_str(),
-        top_left = (left, 192),
+        top_left = (left, y),
         style = text_style!(font = Font24x32, text_color = Rgb565::WHITE)
     )
     .draw(display);
@@ -429,9 +459,10 @@ where
     T: embedded_graphics::DrawTarget<Rgb565>,
 {
     // clear area
+    let y = 108;
     egrectangle!(
-        top_left = (0,150),
-        bottom_right = (SCREEN_WIDTH-1, 182),
+        top_left = (0,y),
+        bottom_right = (SCREEN_WIDTH-1, y+FONT_HEIGHT),
         style = primitive_style!(fill_color = Rgb565::BLACK)
     )
     .draw(display);
@@ -447,7 +478,7 @@ where
     let left = SCREEN_WIDTH - (length as i32) * FONT_WIDTH;
     egtext!(
         text = textbuffer.as_str(),
-        top_left = (left, 150),
+        top_left = (left, y),
         style = text_style!(font = Font24x32, text_color = Rgb565::WHITE)
     )
     .draw(display);
@@ -513,5 +544,3 @@ fn ADC1_RESRDY() {
         }
     }
 }
-
-
