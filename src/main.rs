@@ -7,6 +7,7 @@
  * @auther     Yoshiki Kurokawa <yoshiki.963@gmail.com>
  * @copylight  2021 Yoshiki Kurokawa
  * @license    https://opensource.org/licenses/MIT     MIT license
+ * @version    0.2  2nd version. All function implemented
  * @version    0.1  1st version. Only frequency meter implemented
  */
 
